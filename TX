@@ -1,0 +1,665 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <DHT.h>
+#include "FS.h"
+#include "SPIFFS.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+// Pin definitions for LoRa ESP32
+#define SCK     18
+#define MISO    19
+#define MOSI    23
+#define SS      5
+#define RST     14
+#define DIO0    26
+
+// LoRa configuration parameters
+#define LORA_FREQUENCY    433E6
+#define LORA_BANDWIDTH    125E3
+#define LORA_SPREADING    9
+#define LORA_CODING_RATE  5
+#define LORA_SYNC_WORD    0x12
+
+// Sensor pins
+#define DHT_PIN           4
+#define DHT_TYPE          DHT22
+#define DS18B20_PIN       27
+#define MQ135_PIN         34 
+
+#define LED_PIN           2
+// PENTING: Ubah NODE_ID sesuai dengan yang diharapkan receiver
+// Gunakan "Lora1" atau "Lora2" (bukan "LoRa1" atau "LoRa2")
+#define NODE_ID           "Lora1"  // Ganti dengan "Lora2" untuk node kedua
+#define SEND_INTERVAL     30000
+
+// WiFi Access Point config (opsional untuk debugging)
+const char* ssid = "ESP32-Node-" NODE_ID;
+const char* password = "12345678";
+WebServer server(80);
+
+DHT dht(DHT_PIN, DHT_TYPE);
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature ds18b20(&oneWire);
+
+unsigned long lastSendTime = 0;
+bool isLoraInitialized = false;
+const float RO = 9.83;
+unsigned long dataCount = 0;  // Penghitung data yang disimpan
+
+// Struktur data sensor yang kompatibel dengan receiver
+struct SensorData {
+  unsigned long timestamp;
+  float humidity;
+  float dhtTemp;
+  float ds18b20Temp;
+  int mq135Raw;
+  float rs;
+  float co2;
+  float nh3;
+  float ethylene;
+  bool valid;
+};
+
+SensorData currentReading;
+
+// Fungsi untuk mendapatkan waktu dalam format string
+String getTimeString() {
+  unsigned long ms = millis();
+  unsigned long seconds = ms / 1000;
+  unsigned long minutes = seconds / 60;
+  unsigned long hours = minutes / 60;
+  
+  seconds %= 60;
+  minutes %= 60;
+  hours %= 24;
+  
+  char timeStr[20];
+  sprintf(timeStr, "%02lu:%02lu:%02lu", hours, minutes, seconds);
+  return String(timeStr);
+}
+
+// Fungsi untuk inisialisasi file CSV
+void initCSV() {
+  if (!SPIFFS.exists("/local_data.csv")) {
+    File file = SPIFFS.open("/local_data.csv", FILE_WRITE);
+    if (file) {
+      file.println("Timestamp,Humidity,DHT_Temp,DS18B20_Temp,MQ135_Raw,Rs,CO2,NH3,Ethylene,Valid");
+      file.close();
+      Serial.println("✅ File CSV dibuat dengan header");
+    } else {
+      Serial.println("❌ Gagal membuat file CSV");
+    }
+  }
+}
+
+// Fungsi untuk menyimpan data ke CSV
+void saveToCSV(const SensorData& data) {
+  File file = SPIFFS.open("/local_data.csv", FILE_APPEND);
+  if (!file) {
+    Serial.println("❌ Gagal membuka file CSV untuk menulis");
+    return;
+  }
+  
+  String dataLine = getTimeString() + "," +
+                   String(data.humidity, 2) + "," +
+                   String(data.dhtTemp, 2) + "," +
+                   String(data.ds18b20Temp, 2) + "," +
+                   String(data.mq135Raw) + "," +
+                   String(data.rs, 2) + "," +
+                   String(data.co2, 2) + "," +
+                   String(data.nh3, 2) + "," +
+                   String(data.ethylene, 2) + "," +
+                   (data.valid ? "1" : "0");
+  
+  file.println(dataLine);
+  file.close();
+  dataCount++;
+  Serial.println("✅ Data disimpan ke CSV lokal");
+}
+
+// Fungsi untuk menghapus file CSV
+bool deleteCSV() {
+  if (SPIFFS.exists("/local_data.csv")) {
+    if (SPIFFS.remove("/local_data.csv")) {
+      Serial.println("✅ File CSV berhasil dihapus");
+      initCSV();  // Buat ulang file dengan header
+      dataCount = 0;
+      return true;
+    } else {
+      Serial.println("❌ Gagal menghapus file CSV");
+      return false;
+    }
+  } else {
+    Serial.println("⚠ File CSV tidak ditemukan");
+    initCSV();  // Buat file baru jika tidak ada
+    return true;
+  }
+}
+
+float readDS18B20() {
+  ds18b20.requestTemperatures();
+  delay(100);
+  float tempC = ds18b20.getTempCByIndex(0);
+  if (tempC == DEVICE_DISCONNECTED_C || tempC < -50 || tempC > 100) {
+    Serial.println("❌ DS18B20 reading invalid");
+    return -127.0;
+  }
+  return tempC;
+}
+
+bool initializeLora() {
+  Serial.println("🔄 Initializing LoRa module...");
+  
+  SPI.begin(SCK, MISO, MOSI, SS);
+  LoRa.setPins(SS, RST, DIO0);
+  
+  for (int attempt = 0; attempt < 5; attempt++) {
+    Serial.printf("Attempt %d/5...\n", attempt + 1);
+    
+    if (LoRa.begin(LORA_FREQUENCY)) {
+      LoRa.setSpreadingFactor(LORA_SPREADING);
+      LoRa.setSignalBandwidth(LORA_BANDWIDTH);
+      LoRa.setCodingRate4(LORA_CODING_RATE);
+      LoRa.setSyncWord(LORA_SYNC_WORD);
+      LoRa.setTxPower(20);
+      
+      Serial.println("✅ LoRa initialized successfully!");
+      return true;
+    }
+    
+    Serial.println("❌ LoRa init failed, retrying...");
+    delay(1000);
+  }
+  
+  Serial.println("❌ LoRa initialization failed after 5 attempts!");
+  return false;
+}
+
+float getVoltage(int raw) {
+  return (raw / 4095.0) * 3.3;
+}
+
+float calculateRs(int raw) {
+  float voltage = getVoltage(raw);
+  if (voltage <= 0.05 || voltage >= 3.25) {
+    Serial.printf("⚠ MQ135 voltage out of range: %.3fV\n", voltage);
+    return -1.0;
+  }
+  
+  float RL = 10.0;
+  float rs = ((3.3 - voltage) / voltage) * RL;
+  
+  if (rs < 0.1 || rs > 1000) {
+    Serial.printf("⚠ Rs out of reasonable range: %.2f kΩ\n", rs);
+    return -1.0;
+  }
+  
+  return rs;
+}
+
+float getCO2PPM(float rs) {
+  if (rs <= 0) return -1;
+  float ratio = rs / RO;
+  if (ratio <= 0) return -1;
+  
+  float ppm = 116.6020682 * pow(ratio, -2.769034857);
+  return (ppm > 0 && ppm < 10000) ? ppm : -1;
+}
+
+float getNH3PPM(float rs) {
+  if (rs <= 0) return -1;
+  float ratio = rs / RO;
+  if (ratio <= 0) return -1;
+  
+  float ppm = 102.2 * pow(ratio, -2.473);
+  return (ppm > 0 && ppm < 1000) ? ppm : -1;
+}
+
+float getEthylene(float rs) {
+  if (rs <= 0) return -1;
+  float ratio = rs / RO;
+  if (ratio <= 0) return -1;
+  
+  float ppm = 70.0 * pow(ratio, -2.5);
+  return (ppm > 0 && ppm < 1000) ? ppm : -1;
+}
+
+int readMQ135() {
+  const int samples = 10;
+  int sum = 0;
+  
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(MQ135_PIN);
+    delay(50);
+  }
+  
+  return sum / samples;
+}
+
+bool readDHT(float &humidity, float &temperature) {
+  const int maxRetries = 3;
+  
+  for (int i = 0; i < maxRetries; i++) {
+    humidity = dht.readHumidity();
+    temperature = dht.readTemperature();
+    
+    if (!isnan(humidity) && !isnan(temperature)) {
+      if (humidity >= 0 && humidity <= 100 && 
+          temperature >= -40 && temperature <= 80) {
+        return true;
+      }
+    }
+    
+    Serial.printf("DHT22 retry %d/%d\n", i + 1, maxRetries);
+    delay(2000);
+  }
+  
+  Serial.println("❌ DHT22 reading failed after retries");
+  return false;
+}
+
+SensorData readAllSensors() {
+  SensorData reading;
+  reading.timestamp = millis() / 1000;
+  
+  Serial.println("\n===== READING SENSORS =====");
+  
+  // Baca DHT22
+  bool dhtValid = readDHT(reading.humidity, reading.dhtTemp);
+  if (!dhtValid) {
+    reading.humidity = -1;
+    reading.dhtTemp = -1;
+  }
+  
+  // Baca DS18B20
+  reading.ds18b20Temp = readDS18B20();
+  bool ds18b20Valid = (reading.ds18b20Temp > -50);
+  
+  // Baca MQ135
+  reading.mq135Raw = readMQ135();
+  reading.rs = calculateRs(reading.mq135Raw);
+  bool mq135Valid = (reading.rs > 0);
+  
+  if (mq135Valid) {
+    reading.co2 = getCO2PPM(reading.rs);
+    reading.nh3 = getNH3PPM(reading.rs);
+    reading.ethylene = getEthylene(reading.rs);
+  } else {
+    reading.co2 = -1;
+    reading.nh3 = -1;
+    reading.ethylene = -1;
+  }
+  
+  // Status keseluruhan
+  reading.valid = dhtValid && ds18b20Valid && mq135Valid;
+  
+  // Print hasil
+  Serial.printf("DHT22: %.2f%% RH, %.2f°C [%s]\n", 
+                reading.humidity, reading.dhtTemp, 
+                dhtValid ? "OK" : "FAIL");
+  Serial.printf("DS18B20: %.2f°C [%s]\n", 
+                reading.ds18b20Temp, 
+                ds18b20Valid ? "OK" : "FAIL");
+  Serial.printf("MQ135: Raw=%d, Rs=%.2f kΩ [%s]\n", 
+                reading.mq135Raw, reading.rs,
+                mq135Valid ? "OK" : "FAIL");
+  if (mq135Valid) {
+    Serial.printf("Gases: CO2=%.1f ppm, NH3=%.1f ppm, C2H4=%.1f ppm\n",
+                  reading.co2, reading.nh3, reading.ethylene);
+  }
+  Serial.printf("Overall: %s\n", reading.valid ? "VALID" : "INVALID");
+  Serial.println("============================");
+  
+  return reading;
+}
+
+// Kirim data dengan format yang PERSIS sesuai dengan yang diharapkan receiver
+bool sendLoRaData(const SensorData& reading) {
+  if (!isLoraInitialized) {
+    Serial.println("❌ LoRa not initialized");
+    return false;
+  }
+  
+  // Format JSON yang PERSIS sesuai dengan yang diharapkan receiver
+  DynamicJsonDocument doc(512);
+  doc["node"] = NODE_ID;  // Harus "Lora1" atau "Lora2"
+  
+  // Data object dengan field names yang PERSIS sesuai receiver
+  JsonObject data = doc.createNestedObject("data");
+  data["humidity"] = reading.humidity;
+  data["ds18b20"] = reading.ds18b20Temp;  // PENTING: gunakan "ds18b20" bukan "ds18b20_temp"
+  data["mq135_raw"] = reading.mq135Raw;
+  data["co2"] = reading.co2;
+  data["nh3"] = reading.nh3;
+  data["ethylene"] = reading.ethylene;
+  
+  String payload;
+  serializeJson(doc, payload);
+  
+  Serial.println("📡 Sending LoRa packet:");
+  Serial.println(payload);
+  
+  // Kirim dengan retry
+  const int RETRY_COUNT = 3;
+  for (int attempt = 0; attempt < RETRY_COUNT; attempt++) {
+    Serial.printf("Transmission attempt %d/%d...\n", attempt + 1, RETRY_COUNT);
+    
+    LoRa.beginPacket();
+    LoRa.print(payload);
+    bool success = LoRa.endPacket();
+    
+    if (success) {
+      Serial.println("✅ LoRa transmission successful!");
+      
+      // Blink LED untuk indikasi sukses
+      for (int i = 0; i < 3; i++) {
+        digitalWrite(LED_PIN, HIGH);
+        delay(100);
+        digitalWrite(LED_PIN, LOW);
+        delay(100);
+      }
+      
+      return true;
+    } else {
+      Serial.printf("❌ Transmission attempt %d failed\n", attempt + 1);
+      delay(1000);
+    }
+  }
+  
+  Serial.println("❌ All transmission attempts failed!");
+  
+  // Blink LED untuk indikasi error
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(50);
+    digitalWrite(LED_PIN, LOW);
+    delay(50);
+  }
+  
+  return false;
+}
+
+// Web interface dengan fitur manajemen CSV
+// Web interface sederhana dengan fitur download CSV
+String getWebPage() {
+  // Hitung ukuran file CSV
+  String csvSize = "N/A";
+  if (SPIFFS.exists("/local_data.csv")) {
+    File file = SPIFFS.open("/local_data.csv", "r");
+    if (file) {
+      csvSize = String(file.size() / 1024.0, 1) + " KB";
+      file.close();
+    }
+  }
+  
+  String html = "<html><head>";
+  html += "<title>ESP32 " + String(NODE_ID) + "</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta http-equiv='refresh' content='30'>";
+  html += "<style>";
+  html += "body{font-family:Arial;margin:20px;background:#f8f9fa;}";
+  html += ".container{max-width:500px;margin:0 auto;background:white;padding:15px;border-radius:5px;box-shadow:0 1px 3px rgba(0,0,0,0.12);}";
+  html += "h1,h2{color:#333;margin-top:0;}";
+  html += "table{width:100%;border-collapse:collapse;margin:10px 0;}";
+  html += "th,td{text-align:left;padding:8px;border-bottom:1px solid #ddd;}";
+  html += "th{background:#f1f1f1;}";
+  html += ".btn{display:inline-block;padding:8px 12px;background:#007bff;color:white;text-decoration:none;border-radius:4px;margin:5px 5px 5px 0;}";
+  html += ".btn-red{background:#dc3545;}";
+  html += ".info{background:#e9ecef;padding:10px;border-radius:4px;margin:10px 0;}";
+  html += "</style>";
+  html += "</head><body>";
+  html += "<div class='container'>";
+  
+  // Header
+  html += "<h1>Sensor Node: " + String(NODE_ID) + "</h1>";
+  
+  // Status
+  html += "<div class='info'>";
+  html += "<p><b>LoRa:</b> " + String(isLoraInitialized ? "Connected" : "Disconnected") + "</p>";
+  html += "<p><b>Uptime:</b> " + String(millis() / 1000) + " seconds</p>";
+  html += "</div>";
+  
+  // Sensor Data
+  html += "<h2>Sensor Data</h2>";
+  html += "<table>";
+  html += "<tr><th>Parameter</th><th>Value</th></tr>";
+  html += "<tr><td>Humidity</td><td>" + String(currentReading.humidity, 1) + " %</td></tr>";
+  html += "<tr><td>DHT Temp</td><td>" + String(currentReading.dhtTemp, 1) + " &deg;C</td></tr>";
+  html += "<tr><td>DS18B20</td><td>" + String(currentReading.ds18b20Temp, 1) + " &deg;C</td></tr>";
+  html += "<tr><td>CO2</td><td>" + String(currentReading.co2, 1) + " ppm</td></tr>";
+  html += "<tr><td>NH3</td><td>" + String(currentReading.nh3, 1) + " ppm</td></tr>";
+  html += "<tr><td>Ethylene</td><td>" + String(currentReading.ethylene, 1) + " ppm</td></tr>";
+  html += "</table>";
+  
+  // CSV Management
+  html += "<h2>CSV Data</h2>";
+  html += "<div class='info'>";
+  html += "<p><b>File:</b> /local_data.csv</p>";
+  html += "<p><b>Size:</b> " + csvSize + "</p>";
+  html += "<p><b>Records:</b> " + String(dataCount) + "</p>";
+  html += "</div>";
+  
+  // Action Buttons
+  html += "<a href='/download-csv' class='btn'>Download CSV</a> ";
+  html += "<a href='/delete-csv' class='btn btn-red' onclick='return confirm(\"Hapus file CSV?\")'>Hapus CSV</a>";
+  
+  // Footer
+  html += "<p><small>Auto-refresh: 30s</small></p>";
+  
+  html += "</div></body></html>";
+  
+  return html;
+}
+// Setup web server dengan endpoint untuk manajemen CSV
+void setupWebServer() {
+  // Halaman utama
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/html", getWebPage());
+  });
+  
+  // Download CSV
+  server.on("/download-csv", HTTP_GET, []() {
+    if (SPIFFS.exists("/local_data.csv")) {
+      File file = SPIFFS.open("/local_data.csv", "r");
+      if (file) {
+        server.sendHeader("Content-Disposition", "attachment; filename=data_" + String(NODE_ID) + ".csv");
+        server.sendHeader("Content-Type", "text/csv");
+        server.streamFile(file, "text/csv");
+        file.close();
+        return;
+      }
+    }
+    server.send(404, "text/plain", "File CSV tidak ditemukan");
+  });
+  
+  // Hapus CSV
+  server.on("/delete-csv", HTTP_GET, []() {
+    if (deleteCSV()) {
+      server.sendHeader("Location", "/");
+      server.send(303);
+    } else {
+      server.send(500, "text/plain", "Gagal menghapus file CSV");
+    }
+  });
+  
+  // API untuk mendapatkan data sensor terbaru
+  server.on("/api/data", HTTP_GET, []() {
+    DynamicJsonDocument doc(512);
+    doc["node_id"] = NODE_ID;
+    doc["uptime"] = millis() / 1000;
+    doc["lora_ok"] = isLoraInitialized;
+    doc["csv_records"] = dataCount;
+    
+    JsonObject data = doc.createNestedObject("data");
+    data["humidity"] = currentReading.humidity;
+    data["dht_temp"] = currentReading.dhtTemp;
+    data["ds18b20"] = currentReading.ds18b20Temp;
+    data["mq135_raw"] = currentReading.mq135Raw;
+    data["rs"] = currentReading.rs;
+    data["co2"] = currentReading.co2;
+    data["nh3"] = currentReading.nh3;
+    data["ethylene"] = currentReading.ethylene;
+    data["valid"] = currentReading.valid;
+    
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
+  });
+}
+void sendSensorData() {
+  SensorData data = readAllSensors();
+  currentReading = data;
+  
+  // Simpan ke CSV lokal
+  saveToCSV(data);
+  
+  // Kirim data via LoRa
+  bool success = sendLoRaData(data);
+  
+  if (!success) {
+    Serial.println("⚠ Transmission failed, will retry next cycle");
+  }
+}
+
+// Handle perintah serial
+void handleSerialCommands() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    command.toUpperCase();
+    
+    if (command == "DELETE CSV") {
+      if (deleteCSV()) {
+        Serial.println("✅ File CSV berhasil dihapus dan dibuat ulang dengan header");
+      }
+    } 
+    else if (command == "CSV INFO") {
+      if (SPIFFS.exists("/local_data.csv")) {
+        File file = SPIFFS.open("/local_data.csv", "r");
+        if (file) {
+          Serial.println("=== CSV INFO ===");
+          Serial.printf("Filename: /local_data.csv\n");
+          Serial.printf("Size: %.1f KB\n", file.size() / 1024.0);
+          Serial.printf("Records: %lu\n", dataCount);
+          file.close();
+        }
+      } else {
+        Serial.println("❌ File CSV tidak ditemukan");
+      }
+    }
+    else if (command == "PRINT CSV") {
+      if (SPIFFS.exists("/local_data.csv")) {
+        File file = SPIFFS.open("/local_data.csv", "r");
+        if (file) {
+          Serial.println("=== CSV CONTENT ===");
+          while (file.available()) {
+            Serial.write(file.read());
+          }
+          Serial.println("=== END OF CSV ===");
+          file.close();
+        }
+      } else {
+        Serial.println("❌ File CSV tidak ditemukan");
+      }
+    }
+    else if (command == "HELP") {
+      Serial.println("=== AVAILABLE COMMANDS ===");
+      Serial.println("DELETE CSV - Hapus file CSV dan buat ulang dengan header");
+      Serial.println("CSV INFO - Tampilkan informasi file CSV");
+      Serial.println("PRINT CSV - Tampilkan isi file CSV");
+      Serial.println("HELP - Tampilkan bantuan ini");
+    }
+    else {
+      Serial.println("❓ Perintah tidak dikenali. Ketik HELP untuk bantuan.");
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n🚀 ESP32 Sensor Node Starting...");
+  Serial.println("Node ID: " + String(NODE_ID) + " (Compatible with receiver)");
+  
+  // Setup pins
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  // Initialize sensors
+  Serial.println("🔧 Initializing sensors...");
+  dht.begin();
+  ds18b20.begin();
+  
+  // Set ADC resolution
+  analogReadResolution(12);
+  
+  // Initialize SPIFFS
+  if (!SPIFFS.begin(true)) {
+    Serial.println("❌ Gagal menginisialisasi SPIFFS");
+  } else {
+    Serial.printf("✅ SPIFFS siap. Total: %.1f KB, Terpakai: %.1f KB\n", 
+                 SPIFFS.totalBytes() / 1024.0, SPIFFS.usedBytes() / 1024.0);
+    
+    // Inisialisasi file CSV
+    initCSV();
+  }
+  
+  // Initialize LoRa
+  isLoraInitialized = initializeLora();
+  
+  // Setup WiFi AP untuk debugging (opsional)
+  WiFi.softAP(ssid, password);
+  Serial.println("📶 WiFi AP started: " + String(ssid));
+  Serial.println("🌐 IP: " + WiFi.softAPIP().toString());
+  
+  // Setup web server
+  setupWebServer();
+  server.begin();
+  
+  Serial.println("✅ System initialized!");
+  Serial.println("📡 Transmission interval: " + String(SEND_INTERVAL / 1000) + " seconds");
+  Serial.println("🔗 Compatible with receiver expecting nodes: Lora1, Lora2");
+  Serial.println("💾 CSV logging enabled. Type HELP for available commands.");
+  
+  // Initial sensor reading
+  currentReading = readAllSensors();
+}
+
+void loop() {
+  // Re-initialize LoRa jika gagal
+  if (!isLoraInitialized) {
+    Serial.println("🔄 Attempting to re-initialize LoRa...");
+    isLoraInitialized = initializeLora();
+    delay(5000);
+    return;
+  }
+  
+  // Kirim data sensor
+  if (millis() - lastSendTime >= SEND_INTERVAL) {
+    sendSensorData();
+    lastSendTime = millis();
+  }
+  
+  // Handle web server
+  server.handleClient();
+  
+  // Handle serial commands
+  handleSerialCommands();
+  
+  // Status LED heartbeat
+  static unsigned long lastHeartbeat = 0;
+  if (millis() - lastHeartbeat > 2000) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(50);
+    digitalWrite(LED_PIN, LOW);
+    lastHeartbeat = millis();
+  }
+  
+  delay(100);
+}
